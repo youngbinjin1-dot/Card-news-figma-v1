@@ -11,6 +11,11 @@ const CONFIG = {
     paper: '#F4F2EC', ink: '#14161A', accent: '#2F4BFF', accentSoft: '#E4E8FF',
     muted: '#6B6F78', onDark: '#FFFFFF', onDarkMuted: '#AEB4C8', line: '#D6D3CA',
   },
+  comfort: {                                      // eye-comfort variable modes (switchable in Figma after build)
+    modes: ['sepia', 'dark'],                     // [] = Default mode only (previous behavior)
+    preview: 'default',                           // 'default' | 'sepia' | 'dark' — mode shown on the wrapper
+    sepia: {}, dark: {},                          // optional token overrides, e.g. { 'bg/paper': '#F2E8D0' }
+  },
   brand: { header: 'BRAND · SERIES', footer: '작성자 · 채널명' },
   cover: {
     kicker: 'WEEKLY NOTE',
@@ -65,23 +70,91 @@ const hex = h => ({ r: parseInt(h.slice(1, 3), 16) / 255, g: parseInt(h.slice(3,
 const colName = 'CardNews/' + CONFIG.name;
 let col = (await figma.variables.getLocalVariableCollectionsAsync()).find(c => c.name === colName);
 if (!col) col = figma.variables.createVariableCollection(colName);
-const mode = col.modes[0].modeId;
 const existing = await Promise.all(col.variableIds.map(id => figma.variables.getVariableByIdAsync(id)));
 const pal = CONFIG.palette;
-const tokenDefs = {
-  'bg/paper': pal.paper, 'bg/ink': pal.ink, 'bg/accent': pal.accent, 'bg/accent-soft': pal.accentSoft,
-  'text/ink': pal.ink, 'text/muted': pal.muted, 'text/accent': pal.accent,
-  'text/on-dark': pal.onDark, 'text/on-dark-muted': pal.onDarkMuted, 'line/default': pal.line,
-};
+
+// color math: mix, WCAG contrast, and nudging a color until it reaches a contrast target
+const rgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const toHex = a => '#' + a.map(x => Math.round(Math.max(0, Math.min(255, x))).toString(16).padStart(2, '0')).join('').toUpperCase();
+const mix = (a, b, t) => { const A = rgb(a), B = rgb(b); return toHex(A.map((x, i) => x + (B[i] - x) * t)); };
+const lum = h => { const [r, g, b] = rgb(h).map(x => { x /= 255; return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4; }); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+const contrast = (a, b) => { const x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+const ensure = (fg, bg, min, toward) => { let c = fg; for (let i = 0; i < 30 && contrast(c, bg) < min; i++) c = mix(c, toward, 0.1); return c; };
+
+// token tables per mode. bg/ink vs text/ink and bg/accent vs text/accent are separate tokens so dark mode can split them.
+function tokensFor(m) {
+  if (m === 'default') return {
+    'bg/canvas': '#E9E7E1', 'bg/paper': pal.paper, 'bg/ink': pal.ink, 'bg/accent': pal.accent, 'bg/accent-soft': pal.accentSoft,
+    'text/ink': pal.ink, 'text/muted': pal.muted, 'text/accent': pal.accent,
+    'text/on-dark': pal.onDark, 'text/on-dark-muted': pal.onDarkMuted, 'line/default': pal.line, 'line/on-dark': pal.onDark,
+  };
+  let t;
+  if (m === 'sepia') {
+    const paper = '#F4ECD8', ink = '#3B3229', onDark = '#F4ECD8';
+    const base = mix(pal.accent, '#8B6F4E', 0.35);
+    const accentSoft = mix(base, paper, 0.82);
+    const accent = ensure(ensure(base, paper, 4.5, ink), accentSoft, 4.5, ink);
+    const bgAccent = ensure(base, onDark, 5.5, ink);  // headroom so on-dark-muted can also reach 4.5
+    t = {
+      'bg/canvas': '#E8DFC9', 'bg/paper': paper, 'bg/ink': '#4A3F35', 'bg/accent': bgAccent, 'bg/accent-soft': accentSoft,
+      'text/ink': ink, 'text/muted': '#7A6E60', 'text/accent': accent,
+      'text/on-dark': onDark, 'text/on-dark-muted': '#CBBFA8', 'line/default': '#DDD2BA', 'line/on-dark': onDark,
+    };
+  } else {
+    const paper = '#1C1D21', onDark = '#E4E1DA';
+    const base = mix(pal.accent, '#FFFFFF', 0.2);
+    const accentSoft = mix(base, paper, 0.8);
+    const accent = ensure(ensure(base, paper, 4.5, '#FFFFFF'), accentSoft, 4.5, '#FFFFFF');
+    const bgAccent = ensure(mix(accent, paper, 0.45), onDark, 5.5, paper);
+    t = {
+      'bg/canvas': '#121316', 'bg/paper': paper, 'bg/ink': '#2A2C31', 'bg/accent': bgAccent, 'bg/accent-soft': accentSoft,
+      'text/ink': onDark, 'text/muted': '#9A9DA6', 'text/accent': accent,
+      'text/on-dark': onDark, 'text/on-dark-muted': '#A8ABB3', 'line/default': '#33363C', 'line/on-dark': onDark,
+    };
+  }
+  t = { ...t, ...(CONFIG.comfort[m] || {}) };
+  t['text/muted'] = ensure(t['text/muted'], t['bg/paper'], 4.5, t['text/ink']);
+  for (const bg of ['bg/ink', 'bg/accent']) t['text/on-dark-muted'] = ensure(t['text/on-dark-muted'], t[bg], 4.5, t['text/on-dark']);
+  return t;
+}
+
+// modes: Default + requested comfort modes. If the plan limits modes, fall back to the preview mode's values in a single mode.
+const MODE_NAMES = { default: 'Default', sepia: 'Sepia', dark: 'Dark' };
+const comfortModes = (CONFIG.comfort.modes || []).filter(m => m === 'sepia' || m === 'dark');
+const preview = MODE_NAMES[CONFIG.comfort.preview] ? CONFIG.comfort.preview : 'default';
+let modesUnavailable = false;
+const modeIds = {};
+col.renameMode(col.modes[0].modeId, 'Default');
+modeIds.default = col.modes[0].modeId;
+for (const m of comfortModes) {
+  const found = col.modes.find(x => x.name === MODE_NAMES[m]);
+  if (found) { modeIds[m] = found.modeId; continue; }
+  try { modeIds[m] = col.addMode(MODE_NAMES[m]); } catch (e) { modesUnavailable = true; break; }
+}
+const plan = modesUnavailable
+  ? { default: tokensFor(preview) }
+  : Object.fromEntries(Object.keys(modeIds).map(m => [m, tokensFor(m)]));
+
 const V = {};
-for (const [name, h] of Object.entries(tokenDefs)) {
+for (const name of Object.keys(plan.default)) {
   let v = existing.find(x => x && x.name === name);
   if (!v) v = figma.variables.createVariable(name, col, 'COLOR');
-  v.setValueForMode(mode, hex(h));
+  for (const [m, t] of Object.entries(plan)) v.setValueForMode(modeIds[m], hex(t[name]));
   v.scopes = name.startsWith('text') ? ['TEXT_FILL'] : name.startsWith('line') ? ['STROKE_COLOR', 'SHAPE_FILL', 'FRAME_FILL'] : ['FRAME_FILL', 'SHAPE_FILL'];
   V[name] = v;
 }
-const P = n => [figma.variables.setBoundVariableForPaint({ type: 'SOLID', color: { r: 0, g: 0, b: 0 } }, 'color', V[n])];
+const P = (n, opacity = 1) => [figma.variables.setBoundVariableForPaint({ type: 'SOLID', color: { r: 0, g: 0, b: 0 }, opacity }, 'color', V[n])];
+
+// contrast check for comfort modes (Default keeps the preset as chosen)
+const CHECKS = [
+  ['text/ink', 'bg/paper', 4.5], ['text/muted', 'bg/paper', 4.5], ['text/accent', 'bg/paper', 4.5], ['text/accent', 'bg/accent-soft', 4.5],
+  ['text/on-dark', 'bg/accent', 4.5], ['text/on-dark', 'bg/ink', 4.5], ['text/on-dark-muted', 'bg/ink', 4.5], ['text/on-dark-muted', 'bg/accent', 4.5],
+];
+const contrastWarnings = [];
+for (const m of modesUnavailable ? (preview === 'default' ? [] : [preview]) : comfortModes) {
+  const t = modesUnavailable ? plan.default : plan[m];
+  for (const [fg, bg, min] of CHECKS) { const r = contrast(t[fg], t[bg]); if (r < min) contrastWarnings.push(`${MODE_NAMES[m]}: ${fg} on ${bg} = ${r.toFixed(2)} (< ${min})`); }
+}
 
 // ---- helpers ----
 function T(chars, size, style, color, lh = 140) {
@@ -167,8 +240,9 @@ comp.x = baseX; comp.y = -H - 300;
 // ---- carousel wrapper ----
 const wrap = figma.createAutoLayout('HORIZONTAL', { name: CONFIG.name, itemSpacing: 80 });
 wrap.paddingTop = wrap.paddingBottom = wrap.paddingLeft = wrap.paddingRight = 80;
-wrap.fills = [{ type: 'SOLID', color: hex('#E9E7E1') }];
+wrap.fills = P('bg/canvas');
 wrap.x = baseX; wrap.y = 0;
+if (!modesUnavailable && modeIds[preview]) wrap.setExplicitVariableModeForCollection(col, modeIds[preview]);
 
 // cover
 const cover = shell(figma.createFrame(), 'bg/accent'); cover.name = '01 Cover'; wrap.appendChild(cover);
@@ -184,7 +258,7 @@ if (CONFIG.cover.showIndex) {
   titles.forEach((t, i) => {
     const r = H_('Index ' + (i + 1), 28); add(list, r, true); r.counterAxisAlignItems = 'CENTER';
     r.paddingTop = r.paddingBottom = Math.round(24 * S);
-    r.strokes = [{ type: 'SOLID', color: { r: 1, g: 1, b: 1 }, opacity: 0.3 }];
+    r.strokes = P('line/on-dark', 0.3);
     r.strokeTopWeight = 2; r.strokeBottomWeight = 0; r.strokeLeftWeight = 0; r.strokeRightWeight = 0;
     r.appendChild(T(String(i + 1).padStart(2, '0'), 32, 'black', 'text/on-dark', 120));
     const tt = add(r, T(t, 32, 'semibold', 'text/on-dark', 130), true); tt.layoutGrow = 1;
@@ -225,4 +299,5 @@ const overflow = [];
 for (const f of [cover, close]) { const used = f.children.reduce((s, n) => s + (n.name === 'Spacer' ? 0 : n.height), 0) + PAD_Y * 2; if (used > H) overflow.push(f.name); }
 for (const id of instIds) { const n = await figma.getNodeByIdAsync(id); const used = n.children.reduce((s, c) => s + (c.name === 'Spacer' ? 0 : c.height), 0) + PAD_Y * 2; if (used > H) overflow.push(n.name); }
 
-return { font: `${FAM} (${Object.values(ST).join(', ')})`, wrapId: wrap.id, componentId: comp.id, coverId: cover.id, cardIds: instIds, closingId: close.id, overflow };
+return { font: `${FAM} (${Object.values(ST).join(', ')})`, wrapId: wrap.id, componentId: comp.id, coverId: cover.id, cardIds: instIds, closingId: close.id, overflow,
+  modes: modesUnavailable ? [MODE_NAMES[preview] + ' (single mode)'] : Object.keys(modeIds).map(m => MODE_NAMES[m]), preview: MODE_NAMES[preview], modesUnavailable, contrastWarnings };
